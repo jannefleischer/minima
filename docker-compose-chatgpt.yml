@@ -55,3 +55,20 @@ services:
       - FB_PROJECT=localragex
     depends_on:
       - qdrant
+      
+  mcp-server:
+    build: ./connector
+    volumes:
+      - ./connector:/usr/src/app
+    ports:
+      - 8004:8000
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/usr/src
+      - PYTHONUNBUFFERED=TRUE
+      - INDEXER_BASE=http://indexer:8000
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://bastapiprompting.ils-geomonitoring.de}
+      - CONNECTOR_AUTH=none
+    depends_on:
+      - indexer
