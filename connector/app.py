@@ -29,6 +29,10 @@ import httpx
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+import os
+
+# Read VERBOSE env var (default false)
+VERBOSE = os.environ.get("VERBOSE", "false").lower() in ("1", "true", "yes")
 
 # FastAPI app für HTTP-based MCP
 app = FastAPI(
@@ -47,38 +51,39 @@ app.add_middleware(
 )
 
 
-# Middleware to log incoming request headers and bodies via logger so they
-# appear in Docker/container logs (stdout). This avoids reliance on container
-# filesystem permissions and makes it easy to tail logs from the host.
-@app.middleware("http")
-async def log_requests_middleware(request: Request, call_next):
-    try:
-        raw = await request.body()
-    except Exception:
-        raw = b""
-
-    try:
-        headers = dict(request.headers)
-        logger.info("---- REQUEST START ----")
-        logger.info("PATH: %s", request.url.path)
+if VERBOSE:
+    # Middleware to log incoming request headers and bodies via logger so they
+    # appear in Docker/container logs (stdout). This avoids reliance on container
+    # filesystem permissions and makes it easy to tail logs from the host.
+    @app.middleware("http")
+    async def log_requests_middleware(request: Request, call_next):
         try:
-            logger.info("HEADERS: %s", json.dumps(headers))
+            raw = await request.body()
         except Exception:
-            logger.info("HEADERS: %s", headers)
-        # Log a truncated body to avoid huge binary dumps
-        logger.info("BODY: %r", raw[:4000])
-        logger.info("---- REQUEST END ----")
-    except Exception:
-        logger.exception("Failed to log incoming request via logger")
+            raw = b""
 
-    # Recreate the request stream for downstream handlers by setting _receive
-    async def receive():
-        return {"type": "http.request", "body": raw}
+        try:
+            headers = dict(request.headers)
+            logger.info("---- REQUEST START ----")
+            logger.info("PATH: %s", request.url.path)
+            try:
+                logger.info("HEADERS: %s", json.dumps(headers))
+            except Exception:
+                logger.info("HEADERS: %s", headers)
+            # Log a truncated body to avoid huge binary dumps
+            logger.info("BODY: %r", raw[:4000])
+            logger.info("---- REQUEST END ----")
+        except Exception:
+            logger.exception("Failed to log incoming request via logger")
 
-    request._receive = receive  # type: ignore[attr-defined]
+        # Recreate the request stream for downstream handlers by setting _receive
+        async def receive():
+            return {"type": "http.request", "body": raw}
 
-    response = await call_next(request)
-    return response
+        request._receive = receive  # type: ignore[attr-defined]
+
+        response = await call_next(request)
+        return response
 
 # MCP Server instance
 server = Server("minima_connector")
