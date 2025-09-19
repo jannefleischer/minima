@@ -183,28 +183,51 @@ class Indexer:
     def find(self, query: str) -> Dict[str, any]:
         try:
             logger.info(f"Searching for: {query}")
-            found = self.document_store.search(query, search_type="similarity")
-            
+            # Use Qdrant client directly to get stable point ids and payloads
+            emb = self.embed_model.embed_query(query)
+            # perform a vector search directly on Qdrant so we get point ids and payload
+            found = self.qdrant.search(
+                collection_name=self.config.QDRANT_COLLECTION,
+                query_vector=emb,
+                limit=10,
+                with_payload=True,
+                with_vectors=False,
+            )
+
             if not found:
                 logger.info("No results found")
-                return {"links": set(), "output": ""}
+                return {"links": set(), "output": "", "results": []}
 
             links = set()
             results = []
-            
-            for item in found:
-                path = item.metadata["file_path"].replace(
-                    self.config.CONTAINER_PATH,
-                    self.config.LOCAL_FILES_PATH
-                )
-                links.add(f"file://{path}")
-                results.append(item.page_content)
+
+            for hit in found:
+                # hit.id and hit.payload come from qdrant
+                hit_id = str(getattr(hit, 'id', getattr(hit, 'point_id', None)))
+                payload = getattr(hit, 'payload', {}) or {}
+                # tolerate different payload key names
+                file_path = payload.get('file_path') or payload.get('fpath') or payload.get('fpath')
+                page_content = payload.get('page_content') or payload.get('text') or ''
+
+                if file_path:
+                    path = file_path.replace(self.config.CONTAINER_PATH, self.config.LOCAL_FILES_PATH)
+                    links.add(f"file://{path}")
+
+                results.append({
+                    "id": hit_id,
+                    "text": page_content,
+                    "url": f"file://{file_path}" if file_path else None,
+                    "metadata": payload,
+                })
+
+            output_text = ". ".join([r.get('text', '') for r in results if r.get('text')])
 
             output = {
                 "links": links,
-                "output": ". ".join(results)
+                "output": output_text,
+                "results": results,
             }
-            
+
             logger.info(f"Found {len(found)} results")
             return output
             
@@ -214,3 +237,41 @@ class Indexer:
 
     def embed(self, query: str):
         return self.embed_model.embed_query(query)
+
+    def get_document(self, doc_id: str) -> Dict[str, any]:
+        """
+        Retrieve a single document by its Qdrant point id (as string).
+        Returns a dict with id, title, text, url and metadata or an error key.
+        """
+        try:
+            # Qdrant retrieve expects ids in a list
+            points = self.qdrant.retrieve(
+                collection_name=self.config.QDRANT_COLLECTION,
+                ids=[doc_id],
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            if not points:
+                return {"error": "not_found"}
+
+            p = points[0]
+            payload = getattr(p, 'payload', {}) or {}
+            file_path = payload.get('file_path') or payload.get('fpath')
+            text = payload.get('page_content') or payload.get('text') or ''
+
+            url = None
+            if file_path:
+                url = f"file://{file_path.replace(self.config.CONTAINER_PATH, self.config.LOCAL_FILES_PATH)}"
+
+            return {
+                "id": str(getattr(p, 'id', getattr(p, 'point_id', None))),
+                "title": payload.get('title', ''),
+                "text": text,
+                "url": url,
+                "metadata": payload,
+            }
+
+        except Exception as e:
+            logger.error(f"Error retrieving document {doc_id}: {e}")
+            return {"error": str(e)}

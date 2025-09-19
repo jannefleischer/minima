@@ -37,10 +37,12 @@ class Query(BaseModel):
     response_description='Query local data storage',
 )
 async def query(request: Query):
-    logger.info(f"Received query: {query}")
+    logger.info(f"Received query: {request.query}")
     try:
         result = indexer.find(request.query)
-        logger.info(f"Found {len(result)} results for query: {query}")
+        # result may be a dict with results list
+        count = len(result.get('results', [])) if isinstance(result, dict) else 0
+        logger.info(f"Found {count} results for query: {request.query}")
         logger.info(f"Results: {result}")
         return {"result": result}
     except Exception as e:
@@ -61,6 +63,22 @@ async def embedding(request: Query):
     except Exception as e:
         logger.error(f"Error in processing embedding: {e}")
         return {"error": str(e)}    
+
+
+@router.get(
+    "/document/{doc_id}",
+    response_description='Get document by id'
+)
+async def get_document(doc_id: str):
+    logger.info(f"Received document fetch for id: {doc_id}")
+    try:
+        result = indexer.get_document(doc_id)
+        if 'error' in result:
+            return {"error": result['error']}
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"Error in fetching document {doc_id}: {e}")
+        return {"error": str(e)}
 
 
 @asynccontextmanager
