@@ -179,8 +179,40 @@ class Indexer:
             wait=True
         )
         logger.info(f"Delete response for {len(files_to_remove)} for files: {files_to_remove} is: {response}")
-
+    
     def find(self, query: str) -> Dict[str, any]:
+        try:
+            logger.info(f"Searching for: {query}")
+            found = self.document_store.search(query, search_type="similarity")
+            
+            if not found:
+                logger.info("No results found")
+                return {"links": set(), "output": ""}
+
+            links = set()
+            results = []
+            
+            for item in found:
+                path = item.metadata["file_path"].replace(
+                    self.config.CONTAINER_PATH,
+                    self.config.LOCAL_FILES_PATH
+                )
+                links.add(f"file://{path}")
+                results.append(item.page_content)
+
+            output = {
+                "links": links,
+                "output": ". ".join(results)
+            }
+            
+            logger.info(f"Found {len(found)} results")
+            return output
+            
+        except Exception as e:
+            logger.error(f"Search failed: {str(e)}")
+            return {"error": "Unable to find anything for the given query"}
+
+    def find_with_id(self, query: str) -> Dict[str, any]:
         try:
             logger.info(f"Searching for: {query}")
             # Use Qdrant client directly to get stable point ids and payloads

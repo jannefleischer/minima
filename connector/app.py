@@ -170,7 +170,7 @@ async def handle_search(arguments: Dict[str, Any]) -> List[TextContent]:
     except Exception as e:
         raise McpError(INVALID_PARAMS, f"Invalid arguments: {e}")
     
-    url = f"{INDEXER_BASE_URL}/query"
+    url = f"{INDEXER_BASE_URL}/queryid"
     payload = {"query": request.query}
     
     async with httpx.AsyncClient() as client:
@@ -190,16 +190,26 @@ async def handle_search(arguments: Dict[str, Any]) -> List[TextContent]:
                 results = []
             else:
                 results = []
-                # If the indexer provides explicit links, use them as result items.
-                if isinstance(links, list) and links:
+                # Prefer detailed per-hit results from the indexer (these should include vectordb ids)
+                indexer_results = result.get("results") if isinstance(result, dict) else None
+                if isinstance(indexer_results, list) and len(indexer_results) > 0:
+                    for item in indexer_results:
+                        # The indexer should provide a stable vectordb id (point id) in 'id' or similar
+                        hit_id = item.get("id") or item.get("point_id") or item.get("hit_id") or ""
+                        url = item.get("url", "") or ""
+                        # Prefer an explicit text/title from the indexer, else fall back to the snippet
+                        text_snippet = item.get("text") or item.get("page_content") or output
+                        title = (text_snippet[:120] + '...') if text_snippet and len(text_snippet) > 120 else (text_snippet or "")
+                        results.append({"id": str(hit_id), "title": title, "url": url})
+                elif isinstance(links, list) and links:
+                    # Fallback: use links but don't invent stable ids (use their index)
                     for i, link in enumerate(links, 1):
-                        # Attempt to create a reasonable title from the output snippet
                         title = (output[:120] + '...') if len(output) > 120 else output
                         results.append({"id": str(i), "title": title, "url": link})
                 else:
-                    # Fallback: create a single result that points to the found content
+                    # Last resort: include a single result pointing to content; leave id empty to avoid misleading 'result-1'
                     title = (output[:120] + '...') if len(output) > 120 else output
-                    results.append({"id": "result-1", "title": title, "url": ""})
+                    results.append({"id": "", "title": title, "url": ""})
 
             # MCP requires a content array with one text item whose text is a JSON-encoded string
             payload = {"results": results}
@@ -216,7 +226,7 @@ async def handle_query(arguments: Dict[str, Any]) -> List[TextContent]:
     except Exception as e:
         raise McpError(INVALID_PARAMS, f"Invalid arguments: {e}")
     
-    url = f"{INDEXER_BASE_URL}/query"
+    url = f"{INDEXER_BASE_URL}/queryid"
     payload = {"query": request.query}
     
     async with httpx.AsyncClient() as client:

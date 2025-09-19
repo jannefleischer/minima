@@ -51,6 +51,23 @@ async def query(request: Query):
 
 
 @router.post(
+    "/queryid", 
+    response_description='Query local data storage',
+)
+async def queryid(request: Query):
+    logger.info(f"Received query: {request.query}")
+    try:
+        result = indexer.find_with_id(request.query)
+        # result may be a dict with results list
+        count = len(result.get('results', [])) if isinstance(result, dict) else 0
+        logger.info(f"Found {count} results for query: {request.query}")
+        logger.info(f"Results: {result}")
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"Error in processing query: {e}")
+        return {"error": str(e)}
+
+@router.post(
     "/embedding", 
     response_description='Get embedding for a query',
 )
