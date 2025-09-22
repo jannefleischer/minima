@@ -13,6 +13,7 @@ services:
       - 6335
     volumes:
       - ./qdrant_data:/qdrant/storage
+    restart: unless-stopped
     environment:
       QDRANT__LOG_LEVEL: "INFO"
 
@@ -27,6 +28,7 @@ services:
       - ${LOCAL_FILES_PATH}:/usr/src/app/local_files/
       - ./indexer:/usr/src/app
       - ./indexer_data:/indexer/storage
+    #user: "82:82" #image not build for this :/
     ports:
       - 8001:8000
     environment:
@@ -36,6 +38,7 @@ services:
       - EMBEDDING_MODEL_ID=${EMBEDDING_MODEL_ID}
       - EMBEDDING_SIZE=${EMBEDDING_SIZE}
       - CONTAINER_PATH=/usr/src/app/local_files/
+    restart: unless-stopped
     depends_on:
       - qdrant
 
@@ -55,6 +58,7 @@ services:
       - FB_PROJECT=localragex
     depends_on:
       - qdrant
+    restart: unless-stopped
     profiles:
       - donotstart
       
@@ -72,7 +76,24 @@ services:
       - INDEXER_BASE=http://indexer:8000
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://bastapiprompting.ils-geomonitoring.de}
       - CONNECTOR_AUTH=none
+    restart: unless-stopped
     depends_on:
       - indexer
 
+  webdav:
+    image: bytemark/webdav:latest
+    container_name: webdav
+    ports:
+      - 127.0.0.1:8080:80
+    volumes:
+      - ${LOCAL_FILES_PATH}/..:/var/lib/dav
+    env_file:
+      - .env
+    environment:
+      - AUTH_TYPE=Digest
+      - USERNAME=${WEBDAV_USER}
+      - PASSWORD=${WEBDAV_PASS}
+      - LOCATION=/webdav/
+    restart: unless-stopped
+    # keep this service optional for compose profiles if you don't want it started by default
   

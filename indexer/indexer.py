@@ -1,10 +1,11 @@
 import os
+import fnmatch
 import uuid
 import torch
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pathlib import Path
 
 from qdrant_client import QdrantClient
@@ -67,6 +68,16 @@ class Indexer:
         self.document_store = self._setup_collection()
         self.text_splitter = self._initialize_text_splitter()
 
+    def _container_to_local(self, path: str) -> str:
+        try:
+            container_prefix = (self.config.CONTAINER_PATH or "").rstrip('/') + '/'
+            local_prefix = (self.config.LOCAL_FILES_PATH or "").rstrip('/') + '/'
+            if path.startswith(container_prefix):
+                return path.replace(container_prefix, local_prefix, 1)
+            return path
+        except Exception:
+            return path
+
     def _initialize_qdrant(self) -> QdrantClient:
         return QdrantClient(host=self.config.QDRANT_BOOTSTRAP)
 
@@ -92,11 +103,44 @@ class Indexer:
                     distance=Distance.COSINE
                 ),
             )
-        self.qdrant.create_payload_index(
-            collection_name=self.config.QDRANT_COLLECTION,
-            field_name="fpath",
-            field_schema="keyword"
-        )
+        # Ensure payload index for fast filtering by original file path
+        # LangChain stores Document.metadata under top-level payload key 'metadata',
+        # so the effective path is 'metadata.file_path'. Create indices for both
+        # to be safe (in case of historical data that had top-level file_path).
+        try:
+            self.qdrant.create_payload_index(
+                collection_name=self.config.QDRANT_COLLECTION,
+                field_name="file_path",
+                field_schema="keyword"
+            )
+        except Exception as e:
+            # Index may already exist; log at debug level
+            logger.debug(f"create_payload_index(file_path) skipped/failed: {e}")
+        try:
+            self.qdrant.create_payload_index(
+                collection_name=self.config.QDRANT_COLLECTION,
+                field_name="metadata.file_path",
+                field_schema="keyword"
+            )
+        except Exception as e:
+            logger.debug(f"create_payload_index(metadata.file_path) skipped/failed: {e}")
+        try:
+            self.qdrant.create_payload_index(
+                collection_name=self.config.QDRANT_COLLECTION,
+                field_name="metadata.file_name",
+                field_schema="keyword"
+            )
+        except Exception as e:
+            logger.debug(f"create_payload_index(metadata.file_name) skipped/failed: {e}")
+        # Top-level filename index for direct filtering (e.g., ChatGPT curl)
+        try:
+            self.qdrant.create_payload_index(
+                collection_name=self.config.QDRANT_COLLECTION,
+                field_name="file_name",
+                field_schema="keyword"
+            )
+        except Exception as e:
+            logger.debug(f"create_payload_index(file_name) skipped/failed: {e}")
         return QdrantVectorStore(
             client=self.qdrant,
             collection_name=self.config.QDRANT_COLLECTION,
@@ -121,11 +165,30 @@ class Indexer:
 
             for doc in documents:
                 doc.metadata['file_path'] = loader.file_path
+                try:
+                    file_name = Path(loader.file_path).name
+                    doc.metadata['file_name'] = file_name
+                except Exception:
+                    pass
 
             uuids = [str(uuid.uuid4()) for _ in range(len(documents))]
             ids = self.document_store.add_documents(documents=documents, ids=uuids)
             
             logger.info(f"Successfully processed {len(ids)} documents from {loader.file_path}")
+            # Also set top-level payload keys so external tools can filter by 'file_name' directly
+            try:
+                file_name = Path(loader.file_path).name
+                top_payload = {
+                    "file_path": loader.file_path,
+                    "file_name": file_name,
+                }
+                self.qdrant.set_payload(
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    payload=top_payload,
+                    points=ids,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to set top-level payload keys for {loader.file_path}: {e}")
             return ids
             
         except Exception as e:
@@ -164,10 +227,11 @@ class Indexer:
             logger.info("Nothing to purge")
 
     def remove_from_storage(self, files_to_remove: list[str]):
+        # Stored under payload path 'metadata.file_path'
         filter_conditions = Filter(
             must=[
                 FieldCondition(
-                    key="fpath",
+                    key="metadata.file_path",
                     match=MatchValue(value=fpath)
                 )
                 for fpath in files_to_remove
@@ -187,21 +251,21 @@ class Indexer:
             
             if not found:
                 logger.info("No results found")
-                return {"links": set(), "output": ""}
+                return {"links": [], "output": ""}
 
             links = set()
             results = []
             
             for item in found:
-                path = item.metadata["file_path"].replace(
-                    self.config.CONTAINER_PATH,
-                    self.config.LOCAL_FILES_PATH
-                )
-                links.add(f"file://{path}")
+                meta = item.metadata or {}
+                fpath = meta.get("file_path") or meta.get("source") or (meta.get("metadata", {}) or {}).get("file_path")
+                if fpath:
+                    local_path = self._container_to_local(fpath)
+                    links.add(f"file://{local_path}")
                 results.append(item.page_content)
 
             output = {
-                "links": links,
+                "links": list(links),
                 "output": ". ".join(results)
             }
             
@@ -212,23 +276,104 @@ class Indexer:
             logger.error(f"Search failed: {str(e)}")
             return {"error": "Unable to find anything for the given query"}
 
-    def find_with_id(self, query: str) -> Dict[str, any]:
+    def find_with_id(self, query: str, filters: Optional[Dict[str, any]] = None, limit: int = 10) -> Dict[str, any]:
         try:
             logger.info(f"Searching for: {query}")
-            # Use Qdrant client directly to get stable point ids and payloads
-            emb = self.embed_model.embed_query(query)
-            # perform a vector search directly on Qdrant so we get point ids and payload
-            found = self.qdrant.search(
-                collection_name=self.config.QDRANT_COLLECTION,
-                query_vector=emb,
-                limit=10,
-                with_payload=True,
-                with_vectors=False,
+            # Build an optional Qdrant filter from provided filters
+            q_filter = None
+            if isinstance(filters, dict) and filters:
+                must_conditions = []
+                should_conditions = []
+                fname = filters.get('file_name')
+                fpath = filters.get('file_path')
+                # Detect wildcard patterns like '*' or '?' in the file_name
+                wildcard_mode = False
+                if isinstance(fname, str) and any(ch in fname for ch in ('*', '?')):
+                    wildcard_mode = True
+                if fname:
+                    try:
+                        # Exact-case match on both metadata.file_name and top-level file_name
+                        should_conditions.append(
+                            FieldCondition(key="metadata.file_name", match=MatchValue(value=str(fname)))
+                        )
+                        should_conditions.append(
+                            FieldCondition(key="file_name", match=MatchValue(value=str(fname)))
+                        )
+                    except Exception:
+                        pass
+                if fpath:
+                    must_conditions.append(FieldCondition(key="metadata.file_path", match=MatchValue(value=fpath)))
+                if must_conditions or should_conditions:
+                    q_filter = Filter(must=must_conditions or None, should=should_conditions or None)
+
+            found = []
+            # If filename or filepath filter provided without a meaningful query, prefer scroll listing
+            only_filtering = (q_filter is not None) and (
+                not query or Path(str(filters.get('file_name', ''))).suffix.lower() in ['.pdf','.docx','.txt','.md','.csv','.pptx','.xlsx']
             )
+            if isinstance(filters, dict) and filters and isinstance(filters.get('file_name'), str) and any(ch in filters.get('file_name') for ch in ('*','?')):
+                # Wildcard mode: scan and match in application layer (limit results)
+                pattern = str(filters.get('file_name'))
+                scanned = 0
+                next_page = None
+                max_scan = int(os.environ.get('MAX_WILDCARD_SCAN', '50000'))
+                while True and len(found) < limit and scanned < max_scan:
+                    points_batch, next_page = self.qdrant.scroll(
+                        collection_name=self.config.QDRANT_COLLECTION,
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=min(512, max(1, limit * 20)),
+                        offset=next_page,
+                    )
+                    if not points_batch:
+                        break
+                    for pt in points_batch:
+                        scanned += 1
+                        payload = getattr(pt, 'payload', {}) or {}
+                        meta = payload.get('metadata', {}) or {}
+                        name_top = payload.get('file_name')
+                        name_meta = meta.get('file_name')
+                        candidate = name_top or name_meta
+                        if not candidate:
+                            # derive from file_path if needed
+                            fpath_val = payload.get('file_path') or meta.get('file_path') or meta.get('source')
+                            if isinstance(fpath_val, str):
+                                candidate = Path(fpath_val).name
+                        if isinstance(candidate, str) and fnmatch.fnmatch(candidate.lower(), pattern.lower()):
+                            found.append(pt)
+                            if len(found) >= limit:
+                                break
+                    if not next_page or len(found) >= limit or scanned >= max_scan:
+                        break
+            elif only_filtering:
+                next_page = None
+                while True and len(found) < limit:
+                    points_batch, next_page = self.qdrant.scroll(
+                        collection_name=self.config.QDRANT_COLLECTION,
+                        scroll_filter=q_filter,
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=min(256, max(1, limit - len(found))),
+                        offset=next_page,
+                    )
+                    found.extend(points_batch or [])
+                    if not next_page or len(found) >= limit:
+                        break
+            else:
+                # Vector search, optionally narrowed by filter
+                emb = self.embed_model.embed_query(query)
+                found = self.qdrant.search(
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    query_vector=emb,
+                    limit=limit,
+                    with_payload=True,
+                    with_vectors=False,
+                    query_filter=q_filter,
+                )
 
             if not found:
                 logger.info("No results found")
-                return {"links": set(), "output": "", "results": []}
+                return {"links": [], "output": "", "results": []}
 
             links = set()
             results = []
@@ -238,24 +383,39 @@ class Indexer:
                 hit_id = str(getattr(hit, 'id', getattr(hit, 'point_id', None)))
                 payload = getattr(hit, 'payload', {}) or {}
                 # tolerate different payload key names
-                file_path = payload.get('file_path') or payload.get('fpath') or payload.get('fpath')
+                meta = payload.get('metadata', {}) or {}
+                file_path = (
+                    payload.get('file_path')
+                    or payload.get('fpath')
+                    or meta.get('file_path')
+                    or meta.get('source')
+                )
                 page_content = payload.get('page_content') or payload.get('text') or ''
 
                 if file_path:
-                    path = file_path.replace(self.config.CONTAINER_PATH, self.config.LOCAL_FILES_PATH)
+                    path = self._container_to_local(file_path)
                     links.add(f"file://{path}")
+
+                # Build result item with proper URL using LOCAL_FILES_PATH mapping
+                url = None
+                if file_path:
+                    try:
+                        local_path = file_path.replace(self.config.CONTAINER_PATH, self.config.LOCAL_FILES_PATH)
+                        url = f"file://{local_path}"
+                    except Exception:
+                        url = f"file://{file_path}"
 
                 results.append({
                     "id": hit_id,
                     "text": page_content,
-                    "url": f"file://{file_path}" if file_path else None,
+                    "url": url,
                     "metadata": payload,
                 })
 
             output_text = ". ".join([r.get('text', '') for r in results if r.get('text')])
 
             output = {
-                "links": links,
+                "links": list(links),
                 "output": output_text,
                 "results": results,
             }
@@ -270,9 +430,56 @@ class Indexer:
     def embed(self, query: str):
         return self.embed_model.embed_query(query)
 
+    def list_filenames(self, limit: int = 1000, prefix: Optional[str] = None) -> List[str]:
+        """Collect distinct file names from Qdrant payloads (metadata.file_name) via scroll.
+        Optional in-Python prefix filtering (case-insensitive) and a cap on distinct names returned.
+        """
+        try:
+            names: set[str] = set()
+            next_page = None
+            normalized_prefix = str(prefix).lower() if prefix else None
+            while True and len(names) < limit:
+                points_batch, next_page = self.qdrant.scroll(
+                    collection_name=self.config.QDRANT_COLLECTION,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=512,
+                    offset=next_page,
+                )
+                if not points_batch:
+                    break
+                for pt in points_batch:
+                    payload = getattr(pt, 'payload', {}) or {}
+                    meta = payload.get('metadata', {}) or {}
+                    fname = meta.get('file_name') or meta.get('source')
+                    if not fname:
+                        # Try lower-case variant if only lc is present
+                        fname_lc = meta.get('file_name_lc')
+                        if fname_lc:
+                            fname = fname_lc
+                    if not fname:
+                        continue
+                    if normalized_prefix:
+                        if str(fname).lower().startswith(normalized_prefix):
+                            names.add(str(fname))
+                    else:
+                        names.add(str(fname))
+                    if len(names) >= limit:
+                        break
+                if not next_page or len(names) >= limit:
+                    break
+            return sorted(names)
+        except Exception as e:
+            logger.error(f"Failed to list filenames: {e}")
+            return []
+
+    
+
     def get_document(self, doc_id: str) -> Dict[str, any]:
         """
         Retrieve a single document by its Qdrant point id (as string).
+        Returns the full file content (not just a single chunk) by re-loading
+        the original file; falls back to aggregating all chunks from Qdrant.
         Returns a dict with id, title, text, url and metadata or an error key.
         """
         try:
@@ -289,17 +496,74 @@ class Indexer:
 
             p = points[0]
             payload = getattr(p, 'payload', {}) or {}
-            file_path = payload.get('file_path') or payload.get('fpath')
-            text = payload.get('page_content') or payload.get('text') or ''
+            meta = payload.get('metadata', {}) or {}
+            # Extract original file path from various possible locations
+            file_path = (
+                payload.get('file_path')
+                or payload.get('fpath')
+                or meta.get('file_path')
+                or meta.get('source')
+            )
+            # default to the chunk text if reconstruction fails
+            chunk_text = payload.get('page_content') or payload.get('text') or ''
+
+            full_text = chunk_text
+            if file_path:
+                # Try to re-load the full source file via the appropriate loader
+                try:
+                    loader = self._create_loader(file_path)
+                    docs = loader.load()  # loaders often return one per page (e.g., PDF)
+                    full_text = "\n\n".join([
+                        d.page_content for d in docs if getattr(d, "page_content", None)
+                    ])
+                except Exception as e:
+                    logger.warning(
+                        f"Loader-based full text reconstruction failed for {file_path}: {e}. "
+                        "Falling back to Qdrant payload aggregation."
+                    )
+                    # Fallback: aggregate all chunks in Qdrant with the same file_path
+                    try:
+                        flt = Filter(
+                            must=[
+                                FieldCondition(
+                                    key="metadata.file_path",
+                                    match=MatchValue(value=file_path),
+                                )
+                            ]
+                        )
+                        # Scroll in pages to collect all chunks
+                        all_parts: list[str] = []
+                        next_page = None
+                        while True:
+                            points_batch, next_page = self.qdrant.scroll(
+                                collection_name=self.config.QDRANT_COLLECTION,
+                                scroll_filter=flt,
+                                with_payload=True,
+                                with_vectors=False,
+                                limit=1024,
+                                offset=next_page,
+                            )
+                            for pt in points_batch or []:
+                                pp = getattr(pt, "payload", {}) or {}
+                                txt = pp.get("page_content") or pp.get("text") or ""
+                                if txt:
+                                    all_parts.append(txt)
+                            if not next_page:
+                                break
+                        if all_parts:
+                            full_text = "\n\n".join(all_parts)
+                    except Exception as ee:
+                        logger.error(f"Failed to aggregate chunks from Qdrant for {file_path}: {ee}")
 
             url = None
             if file_path:
-                url = f"file://{file_path.replace(self.config.CONTAINER_PATH, self.config.LOCAL_FILES_PATH)}"
+                local_path = self._container_to_local(file_path)
+                url = f"file://{local_path}"
 
             return {
                 "id": str(getattr(p, 'id', getattr(p, 'point_id', None))),
-                "title": payload.get('title', ''),
-                "text": text,
+                "title": Path(file_path).name if file_path else payload.get('title', ''),
+                "text": full_text,
                 "url": url,
                 "metadata": payload,
             }

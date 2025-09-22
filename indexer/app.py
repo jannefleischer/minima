@@ -9,6 +9,7 @@ from fastapi import FastAPI, APIRouter
 from contextlib import asynccontextmanager
 from fastapi_utilities import repeat_every
 from async_loop import index_loop, crawl_loop
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +31,11 @@ init_loader_dependencies()
 
 class Query(BaseModel):
     query: str
+
+class QueryWithFilters(BaseModel):
+    query: str
+    filters: dict | None = None
+    limit: int | None = 10
 
 
 @router.post(
@@ -54,10 +60,10 @@ async def query(request: Query):
     "/queryid", 
     response_description='Query local data storage',
 )
-async def queryid(request: Query):
+async def queryid(request: QueryWithFilters):
     logger.info(f"Received query: {request.query}")
     try:
-        result = indexer.find_with_id(request.query)
+        result = indexer.find_with_id(request.query, filters=request.filters, limit=(request.limit or 10))
         # result may be a dict with results list
         count = len(result.get('results', [])) if isinstance(result, dict) else 0
         logger.info(f"Found {count} results for query: {request.query}")
@@ -97,6 +103,18 @@ async def get_document(doc_id: str):
         logger.error(f"Error in fetching document {doc_id}: {e}")
         return {"error": str(e)}
 
+
+@router.get(
+    "/filenames",
+    response_description='List distinct filenames in index'
+)
+async def list_filenames(prefix: Optional[str] = None, limit: int = 1000):
+    try:
+        names = indexer.list_filenames(limit=limit, prefix=prefix)
+        return {"result": names}
+    except Exception as e:
+        logger.error(f"Error listing filenames: {e}")
+        return {"error": str(e)}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

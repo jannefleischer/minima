@@ -91,6 +91,8 @@ server = Server("minima_connector")
 # Request models
 class SearchRequest(BaseModel):
     query: str = Field(description="Search query for local documents")
+    filters: Dict[str, Any] | None = None
+    limit: int | None = 10
 
 class QueryRequest(BaseModel):
     query: str = Field(description="Query text for document search")
@@ -171,7 +173,12 @@ async def handle_search(arguments: Dict[str, Any]) -> List[TextContent]:
         raise McpError(INVALID_PARAMS, f"Invalid arguments: {e}")
     
     url = f"{INDEXER_BASE_URL}/queryid"
-    payload = {"query": request.query}
+    # Heuristic: if the query looks like a filename with an extension, pass it as a file_name filter
+    filters = request.filters or {}
+    if not filters and "." in request.query and len(request.query) < 260:
+        # do not overwrite if user provided filters; this is an assistive heuristic only
+        filters = {"file_name": request.query.strip()}
+    payload = {"query": request.query, "filters": filters, "limit": request.limit or 10}
     
     async with httpx.AsyncClient() as client:
         try:
@@ -198,8 +205,14 @@ async def handle_search(arguments: Dict[str, Any]) -> List[TextContent]:
                         hit_id = item.get("id") or item.get("point_id") or item.get("hit_id") or ""
                         url = item.get("url", "") or ""
                         # Prefer an explicit text/title from the indexer, else fall back to the snippet
+                        meta = item.get("metadata", {}) if isinstance(item, dict) else {}
+                        inner_meta = meta.get("metadata", {}) if isinstance(meta, dict) else {}
+                        file_name = inner_meta.get("file_name") or inner_meta.get("source")
                         text_snippet = item.get("text") or item.get("page_content") or output
-                        title = (text_snippet[:120] + '...') if text_snippet and len(text_snippet) > 120 else (text_snippet or "")
+                        if isinstance(file_name, str) and file_name.strip():
+                            title = file_name.strip()
+                        else:
+                            title = (text_snippet[:120] + '...') if text_snippet and len(text_snippet) > 120 else (text_snippet or "")
                         results.append({"id": str(hit_id), "title": title, "url": url})
                 elif isinstance(links, list) and links:
                     # Fallback: use links but don't invent stable ids (use their index)
