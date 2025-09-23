@@ -68,15 +68,15 @@ class Indexer:
         self.document_store = self._setup_collection()
         self.text_splitter = self._initialize_text_splitter()
 
-    def _container_to_local(self, path: str) -> str:
-        try:
-            container_prefix = (self.config.CONTAINER_PATH or "").rstrip('/') + '/'
-            local_prefix = (self.config.LOCAL_FILES_PATH or "").rstrip('/') + '/'
-            if path.startswith(container_prefix):
-                return path.replace(container_prefix, local_prefix, 1)
-            return path
-        except Exception:
-            return path
+    # def _container_to_local(self, path: str) -> str:
+    #     try:
+    #         container_prefix = (self.config.CONTAINER_PATH or "").rstrip('/') + '/'
+    #         local_prefix = (self.config.LOCAL_FILES_PATH or "").rstrip('/') + '/'
+    #         if path.startswith(container_prefix):
+    #             return path.replace(container_prefix, local_prefix, 1)
+    #         return path
+    #     except Exception:
+    #         return path
 
     def _initialize_qdrant(self) -> QdrantClient:
         return QdrantClient(host=self.config.QDRANT_BOOTSTRAP)
@@ -245,11 +245,8 @@ class Indexer:
             results = []
             
             for item in found:
-                meta = item.metadata or {}
-                fpath = meta.get("file_path") or meta.get("source") or (meta.get("metadata", {}) or {}).get("file_path")
-                if fpath:
-                    local_path = self._container_to_local(fpath)
-                    links.add(f"file://{local_path}")
+                path = item.get("file_path")
+                links.add(f"file://{path}")
                 results.append(item.page_content)
 
             output = {
@@ -380,8 +377,13 @@ class Indexer:
                     "url": url,
                     "metadata": payload,
                 })
-            #shortcut: chatGPT Connectors need full text (or a working chunks/paging solution, stiching it together is currently easyier)
-            output_text = ". ".join([r.get('text', '') for r in results if r.get('text')])
+
+            #chatGPT Connectors needs full text or a working chunks/paging solution.
+            try:
+                output_text = self.get_document(hit_id).get(text) #is hit_id the uuid?
+            except Exception as e:
+                #shortcut: Stiching it together might currently be more stable (and faster?)
+                output_text = ". ".join([r.get('text', '') for r in results if r.get('text')])
 
             output = {
                 "links": list(links),
