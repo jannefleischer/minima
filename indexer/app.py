@@ -46,9 +46,7 @@ async def query(request: Query):
     logger.info(f"Received query: {request.query}")
     try:
         result = indexer.find(request.query)
-        # result may be a dict with results list
-        count = len(result.get('results', [])) if isinstance(result, dict) else 0
-        logger.info(f"Found {count} results for query: {request.query}")
+        logger.info(f"Found {len(result.get('results', [])) if isinstance(result, dict) else 0} results for query: {request.query}")
         logger.info(f"Results: {result}")
         return {"result": result}
     except Exception as e:
@@ -64,9 +62,7 @@ async def queryid(request: QueryWithFilters):
     logger.info(f"Received query: {request.query}")
     try:
         result = indexer.find_with_id(request.query, filters=request.filters, limit=(request.limit or 10))
-        # result may be a dict with results list
-        count = len(result.get('results', [])) if isinstance(result, dict) else 0
-        logger.info(f"Found {count} results for query: {request.query}")
+        logger.info(f"Found {len(result.get('results', [])) if isinstance(result, dict) else 0} results for query: {request.query}")
         logger.info(f"Results: {result}")
         return {"result": result}
     except Exception as e:

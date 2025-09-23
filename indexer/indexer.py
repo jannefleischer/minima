@@ -103,44 +103,33 @@ class Indexer:
                     distance=Distance.COSINE
                 ),
             )
-        # Ensure payload index for fast filtering by original file path
-        # LangChain stores Document.metadata under top-level payload key 'metadata',
-        # so the effective path is 'metadata.file_path'. Create indices for both
-        # to be safe (in case of historical data that had top-level file_path).
-        try:
-            self.qdrant.create_payload_index(
-                collection_name=self.config.QDRANT_COLLECTION,
-                field_name="file_path",
-                field_schema="keyword"
-            )
-        except Exception as e:
-            # Index may already exist; log at debug level
-            logger.debug(f"create_payload_index(file_path) skipped/failed: {e}")
-        try:
-            self.qdrant.create_payload_index(
-                collection_name=self.config.QDRANT_COLLECTION,
-                field_name="metadata.file_path",
-                field_schema="keyword"
-            )
-        except Exception as e:
-            logger.debug(f"create_payload_index(metadata.file_path) skipped/failed: {e}")
-        try:
-            self.qdrant.create_payload_index(
-                collection_name=self.config.QDRANT_COLLECTION,
-                field_name="metadata.file_name",
-                field_schema="keyword"
-            )
-        except Exception as e:
-            logger.debug(f"create_payload_index(metadata.file_name) skipped/failed: {e}")
-        # Top-level filename index for direct filtering (e.g., ChatGPT curl)
-        try:
-            self.qdrant.create_payload_index(
-                collection_name=self.config.QDRANT_COLLECTION,
-                field_name="file_name",
-                field_schema="keyword"
-            )
-        except Exception as e:
-            logger.debug(f"create_payload_index(file_name) skipped/failed: {e}")
+        self.qdrant.create_payload_index(
+            collection_name=self.config.QDRANT_COLLECTION,
+            field_name="file_path",
+            field_schema="keyword"
+        )
+        # try:
+        #     self.qdrant.create_payload_index(
+        #         collection_name=self.config.QDRANT_COLLECTION,
+        #         field_name="metadata.file_path",
+        #         field_schema="keyword"
+        #     )
+        # except Exception as e:
+        #     logger.debug(f"create_payload_index(metadata.file_path) skipped/failed: {e}")
+        self.qdrant.create_payload_index(
+            collection_name=self.config.QDRANT_COLLECTION,
+            field_name="file_name",
+            field_schema="keyword"
+        # )
+        # # Top-level filename index for direct filtering (e.g., ChatGPT curl)
+        # try:
+        #     self.qdrant.create_payload_index(
+        #         collection_name=self.config.QDRANT_COLLECTION,
+        #         field_name="file_name",
+        #         field_schema="keyword"
+        #     )
+        # except Exception as e:
+        #     logger.debug(f"create_payload_index(file_name) skipped/failed: {e}")
         return QdrantVectorStore(
             client=self.qdrant,
             collection_name=self.config.QDRANT_COLLECTION,
@@ -227,11 +216,10 @@ class Indexer:
             logger.info("Nothing to purge")
 
     def remove_from_storage(self, files_to_remove: list[str]):
-        # Stored under payload path 'metadata.file_path'
         filter_conditions = Filter(
             must=[
                 FieldCondition(
-                    key="metadata.file_path",
+                    key="file_path",
                     match=MatchValue(value=fpath)
                 )
                 for fpath in files_to_remove
@@ -281,28 +269,21 @@ class Indexer:
             logger.info(f"Searching for: {query}")
             # Build an optional Qdrant filter from provided filters
             q_filter = None
-            if isinstance(filters, dict) and filters:
+            if isinstance(filters, dict):
                 must_conditions = []
                 should_conditions = []
                 fname = filters.get('file_name')
                 fpath = filters.get('file_path')
-                # Detect wildcard patterns like '*' or '?' in the file_name
-                wildcard_mode = False
-                if isinstance(fname, str) and any(ch in fname for ch in ('*', '?')):
-                    wildcard_mode = True
+                wildcard_mode = isinstance(fname, str) and any(ch in fname for ch in ('*', '?'))
                 if fname:
                     try:
-                        # Exact-case match on both metadata.file_name and top-level file_name
-                        should_conditions.append(
-                            FieldCondition(key="metadata.file_name", match=MatchValue(value=str(fname)))
-                        )
                         should_conditions.append(
                             FieldCondition(key="file_name", match=MatchValue(value=str(fname)))
                         )
                     except Exception:
                         pass
                 if fpath:
-                    must_conditions.append(FieldCondition(key="metadata.file_path", match=MatchValue(value=fpath)))
+                    must_conditions.append(FieldCondition(key="file_path", match=MatchValue(value=fpath)))
                 if must_conditions or should_conditions:
                     q_filter = Filter(must=must_conditions or None, should=should_conditions or None)
 
@@ -311,8 +292,7 @@ class Indexer:
             only_filtering = (q_filter is not None) and (
                 not query or Path(str(filters.get('file_name', ''))).suffix.lower() in ['.pdf','.docx','.txt','.md','.csv','.pptx','.xlsx']
             )
-            if isinstance(filters, dict) and filters and isinstance(filters.get('file_name'), str) and any(ch in filters.get('file_name') for ch in ('*','?')):
-                # Wildcard mode: scan and match in application layer (limit results)
+            if isinstance(filters, dict) and isinstance(filters.get('file_name'), str) and any(ch in filters.get('file_name') for ch in ('*','?')):
                 pattern = str(filters.get('file_name'))
                 scanned = 0
                 next_page = None
@@ -330,16 +310,8 @@ class Indexer:
                     for pt in points_batch:
                         scanned += 1
                         payload = getattr(pt, 'payload', {}) or {}
-                        meta = payload.get('metadata', {}) or {}
                         name_top = payload.get('file_name')
-                        name_meta = meta.get('file_name')
-                        candidate = name_top or name_meta
-                        if not candidate:
-                            # derive from file_path if needed
-                            fpath_val = payload.get('file_path') or meta.get('file_path') or meta.get('source')
-                            if isinstance(fpath_val, str):
-                                candidate = Path(fpath_val).name
-                        if isinstance(candidate, str) and fnmatch.fnmatch(candidate.lower(), pattern.lower()):
+                        if isinstance(name_top, str) and fnmatch.fnmatch(name_top.lower(), pattern.lower()):
                             found.append(pt)
                             if len(found) >= limit:
                                 break
@@ -386,15 +358,12 @@ class Indexer:
                 meta = payload.get('metadata', {}) or {}
                 file_path = (
                     payload.get('file_path')
-                    or payload.get('fpath')
-                    or meta.get('file_path')
-                    or meta.get('source')
                 )
                 page_content = payload.get('page_content') or payload.get('text') or ''
 
                 if file_path:
-                    path = self._container_to_local(file_path)
-                    links.add(f"file://{path}")
+                    # path = self._container_to_local(file_path)
+                    links.add(f"file://{file_path}")
 
                 # Build result item with proper URL using LOCAL_FILES_PATH mapping
                 url = None
@@ -411,7 +380,7 @@ class Indexer:
                     "url": url,
                     "metadata": payload,
                 })
-
+            #shortcut: chatGPT Connectors need full text (or a working chunks/paging solution, stiching it together is currently easyier)
             output_text = ". ".join([r.get('text', '') for r in results if r.get('text')])
 
             output = {
@@ -431,14 +400,13 @@ class Indexer:
         return self.embed_model.embed_query(query)
 
     def list_filenames(self, limit: int = 1000, prefix: Optional[str] = None) -> List[str]:
-        """Collect distinct file names from Qdrant payloads (metadata.file_name) via scroll.
-        Optional in-Python prefix filtering (case-insensitive) and a cap on distinct names returned.
+        """Collect distinct file names from Qdrant payloads (file_name) via scroll.
         """
         try:
             names: set[str] = set()
             next_page = None
             normalized_prefix = str(prefix).lower() if prefix else None
-            while True and len(names) < limit:
+            while len(names) < limit:
                 points_batch, next_page = self.qdrant.scroll(
                     collection_name=self.config.QDRANT_COLLECTION,
                     with_payload=True,
@@ -451,19 +419,14 @@ class Indexer:
                 for pt in points_batch:
                     payload = getattr(pt, 'payload', {}) or {}
                     meta = payload.get('metadata', {}) or {}
-                    fname = meta.get('file_name') or meta.get('source')
-                    if not fname:
-                        # Try lower-case variant if only lc is present
-                        fname_lc = meta.get('file_name_lc')
-                        if fname_lc:
-                            fname = fname_lc
-                    if not fname:
+                    file_name = payload.get('file_name')
+                    if not file_name:
                         continue
                     if normalized_prefix:
-                        if str(fname).lower().startswith(normalized_prefix):
-                            names.add(str(fname))
+                        if str(file_name).lower().startswith(normalized_prefix):
+                            names.add(str(file_name))
                     else:
-                        names.add(str(fname))
+                        names.add(str(file_name))
                     if len(names) >= limit:
                         break
                 if not next_page or len(names) >= limit:
@@ -472,8 +435,6 @@ class Indexer:
         except Exception as e:
             logger.error(f"Failed to list filenames: {e}")
             return []
-
-    
 
     def get_document(self, doc_id: str) -> Dict[str, any]:
         """
@@ -495,15 +456,9 @@ class Indexer:
                 return {"error": "not_found"}
 
             p = points[0]
-            payload = getattr(p, 'payload', {}) or {}
-            meta = payload.get('metadata', {}) or {}
-            # Extract original file path from various possible locations
-            file_path = (
-                payload.get('file_path')
-                or payload.get('fpath')
-                or meta.get('file_path')
-                or meta.get('source')
-            )
+            payload = getattr(p, 'payload', {})
+            meta = payload.get('metadata', {})
+            file_path = payload.get('file_path')
             # default to the chunk text if reconstruction fails
             chunk_text = payload.get('page_content') or payload.get('text') or ''
 
@@ -526,7 +481,7 @@ class Indexer:
                         flt = Filter(
                             must=[
                                 FieldCondition(
-                                    key="metadata.file_path",
+                                    key="file_path",
                                     match=MatchValue(value=file_path),
                                 )
                             ]
@@ -557,8 +512,8 @@ class Indexer:
 
             url = None
             if file_path:
-                local_path = self._container_to_local(file_path)
-                url = f"file://{local_path}"
+                # local_path = self._container_to_local(file_path)
+                url = f"file://{file_path}"
 
             return {
                 "id": str(getattr(p, 'id', getattr(p, 'point_id', None))),
