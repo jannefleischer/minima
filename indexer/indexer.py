@@ -120,7 +120,7 @@ class Indexer:
             collection_name=self.config.QDRANT_COLLECTION,
             field_name="file_name",
             field_schema="keyword"
-        # )
+        )
         # # Top-level filename index for direct filtering (e.g., ChatGPT curl)
         # try:
         #     self.qdrant.create_payload_index(
